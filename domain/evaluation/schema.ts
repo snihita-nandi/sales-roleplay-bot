@@ -44,10 +44,28 @@ export const evaluationRubricSchema = z
   })
   .strict();
 
-export const evaluationDimensionSchema = z
+export const evaluationEvidenceSchema = z
   .object({
+    transcriptIndex: z.number().int().nonnegative().max(499),
+    speaker: z.enum(["user", "customer"]),
+    shortQuote: z.string().trim().min(1).max(300),
+    explanation: z.string().trim().min(1).max(500),
+  })
+  .strict();
+
+export const evaluationFeedbackItemSchema = z
+  .object({
+    title: z.string().trim().min(1).max(100),
+    score: z.number().int().min(0).max(20).optional(),
+    feedback: z.string().trim().min(1).max(1_000),
+    evidence: z.array(evaluationEvidenceSchema).max(5),
+    betterResponse: z.string().trim().min(1).max(1_000).optional(),
+  })
+  .strict();
+
+export const evaluationDimensionSchema = evaluationFeedbackItemSchema
+  .extend({
     score: z.number().int().min(0).max(20),
-    evidence: z.string().trim().min(1).max(1_000),
   })
   .strict();
 
@@ -60,9 +78,9 @@ export const evaluationModelResponseSchema = z
     communication: evaluationDimensionSchema,
     closing: evaluationDimensionSchema,
     continuationAdvice: z.string().trim().min(1).max(1_000),
-    strengths: z.array(z.string().trim().min(1).max(500)).max(5),
-    missedOpportunities: z.array(z.string().trim().min(1).max(500)).min(1).max(5),
-    recommendedImprovements: z.array(z.string().trim().min(1).max(500)).min(1).max(5),
+    strengths: z.array(evaluationFeedbackItemSchema).max(5),
+    missedOpportunities: z.array(evaluationFeedbackItemSchema).min(1).max(5),
+    recommendedImprovements: z.array(evaluationFeedbackItemSchema).min(1).max(5),
   })
   .strict();
 
@@ -98,3 +116,5 @@ export type EvaluationRequest = z.infer<typeof evaluationRequestSchema>;
 export type EvaluationRubric = z.infer<typeof evaluationRubricSchema>;
 export type EvaluationResult = z.infer<typeof evaluationResultSchema>;
 export type EvaluationModelResponse = z.infer<typeof evaluationModelResponseSchema>;
+export type EvaluationEvidence = z.infer<typeof evaluationEvidenceSchema>;
+export type EvaluationFeedbackItem = z.infer<typeof evaluationFeedbackItemSchema>;

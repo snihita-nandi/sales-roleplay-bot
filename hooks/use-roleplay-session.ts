@@ -8,6 +8,7 @@ import type { CallTermination } from "@/domain/roleplay/termination";
 import type { CallMetrics, TranscriptEntry } from "@/domain/roleplay/types";
 import type { PublicScenario } from "@/domain/scenarios/schema";
 import { GeminiLiveTransport } from "@/infrastructure/gemini/browser-live-transport";
+import { isCustomerVoice } from "@/infrastructure/gemini/customer-voice";
 
 export interface CompletedRoleplay {
   transcript: TranscriptEntry[];
@@ -28,6 +29,8 @@ export function useRoleplaySession(
   const transportRef = useRef<GeminiLiveTransport | null>(null);
   const completionSentRef = useRef(false);
   const onCompleteRef = useRef(onComplete);
+  const sessionGenerationRef = useRef(0);
+  const activeSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     onCompleteRef.current = onComplete;
@@ -36,6 +39,12 @@ export function useRoleplaySession(
   const start = useCallback(async () => {
     dispatch({ type: "START" });
     completionSentRef.current = false;
+    const generation = sessionGenerationRef.current + 1;
+    sessionGenerationRef.current = generation;
+    activeSessionIdRef.current = null;
+    const previousTransport = transportRef.current;
+    transportRef.current = null;
+    await previousTransport?.close();
     let stream: MediaStream | null = null;
 
     try {
@@ -55,27 +64,64 @@ export function useRoleplaySession(
         body: JSON.stringify({
           categoryId: scenario.categoryId,
           archetypeId: scenario.archetypeId,
+          scenarioId: scenario.profileScenarioId,
           difficulty: scenario.difficulty,
+          ...(scenario.followUpContext
+            ? { followUpContext: scenario.followUpContext }
+            : {}),
         }),
       });
       const payload: unknown = await response.json();
       if (!response.ok) {
         throw new Error("A secure live session could not be created.");
       }
+      const voiceName = response.headers.get("X-Customer-Voice");
+      if (!isCustomerVoice(voiceName)) {
+        throw new Error("The customer voice could not be resolved.");
+      }
       const bootstrap = roleplaySessionResponseSchema.parse(payload);
-      const transport = new GeminiLiveTransport(bootstrap, stream, {
-        onConnected: () => dispatch({ type: "CONNECTED", at: Date.now() }),
-        onTranscript: (entry) => dispatch({ type: "TRANSCRIPT", entry }),
-        onInterrupted: () => dispatch({ type: "INTERRUPTED" }),
-        onCustomerEnded: (termination) =>
-          dispatch({ type: "CUSTOMER_ENDED", termination }),
-        onError: (message) => dispatch({ type: "FAIL", message }),
-        onClosed: () => dispatch({ type: "CLOSED" }),
+      activeSessionIdRef.current = bootstrap.sessionId;
+      const isCurrentSession = () =>
+        sessionGenerationRef.current === generation &&
+        activeSessionIdRef.current === bootstrap.sessionId;
+      let transport: GeminiLiveTransport | null = null;
+      transport = new GeminiLiveTransport(bootstrap, voiceName, stream, {
+        onConnected: () => {
+          if (isCurrentSession()) dispatch({ type: "CONNECTED", at: Date.now() });
+        },
+        onTranscript: (entry) => {
+          if (isCurrentSession()) dispatch({ type: "TRANSCRIPT", entry });
+        },
+        onInterrupted: () => {
+          if (isCurrentSession()) dispatch({ type: "INTERRUPTED" });
+        },
+        onCustomerEnded: (termination) => {
+          if (isCurrentSession()) {
+            dispatch({ type: "CUSTOMER_ENDED", termination });
+          }
+        },
+        onError: (message) => {
+          if (!isCurrentSession()) return;
+          sessionGenerationRef.current += 1;
+          activeSessionIdRef.current = null;
+          transportRef.current = null;
+          dispatch({ type: "FAIL", message });
+          void transport?.close();
+        },
+        onClosed: () => {
+          if (isCurrentSession()) dispatch({ type: "CLOSED" });
+        },
       });
       transportRef.current = transport;
       await transport.connect();
     } catch (error: unknown) {
       for (const track of stream?.getTracks() ?? []) track.stop();
+      if (sessionGenerationRef.current !== generation) return;
+      sessionGenerationRef.current += 1;
+      activeSessionIdRef.current = null;
+      const failedTransport = transportRef.current;
+      transportRef.current = null;
+      void failedTransport?.close();
       const message =
         error instanceof DOMException && error.name === "NotAllowedError"
           ? "Microphone access was denied. Allow access in your browser and try again."
@@ -84,7 +130,13 @@ export function useRoleplaySession(
             : "The roleplay could not be started.";
       dispatch({ type: "FAIL", message });
     }
-  }, [scenario.archetypeId, scenario.categoryId, scenario.difficulty]);
+  }, [
+    scenario.archetypeId,
+    scenario.categoryId,
+    scenario.difficulty,
+    scenario.profileScenarioId,
+    scenario.followUpContext,
+  ]);
 
   const end = useCallback(() => dispatch({ type: "END" }), []);
 
@@ -126,7 +178,10 @@ export function useRoleplaySession(
 
   useEffect(
     () => () => {
+      sessionGenerationRef.current += 1;
+      activeSessionIdRef.current = null;
       void transportRef.current?.close();
+      transportRef.current = null;
     },
     [],
   );

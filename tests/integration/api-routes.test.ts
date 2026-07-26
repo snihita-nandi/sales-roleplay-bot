@@ -1,27 +1,33 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/infrastructure/gemini/live-session", () => ({
-  provisionLiveSession: vi.fn(async () => ({
-    ephemeralToken: "ephemeral-test-token",
-    expiresAt: "2026-07-22T12:00:00.000Z",
-    model: "gemini-live-test",
-  })),
+const liveSessionMocks = vi.hoisted(() => ({
+  provisionLiveSession: vi.fn(async (scenario: unknown, voiceName: string) => {
+    void scenario;
+    void voiceName;
+    return {
+      ephemeralToken: "ephemeral-test-token",
+      expiresAt: "2026-07-22T12:00:00.000Z",
+      model: "gemini-live-test",
+    };
+  }),
 }));
+
+vi.mock("@/infrastructure/gemini/live-session", () => liveSessionMocks);
 
 const evaluationMocks = vi.hoisted(() => ({
   evaluateRoleplay: vi.fn(async () => ({
     overallScore: 25,
     summary: "The representative opened clearly but did not explore the customer's needs.",
-    discovery: { score: 2, evidence: "No discovery question was asked." },
-    objectionHandling: { score: 3, evidence: "The objection was acknowledged briefly." },
-    listening: { score: 5, evidence: "The response referenced the customer's concern." },
-    communication: { score: 10, evidence: "The opening was concise and understandable." },
-    closing: { score: 5, evidence: "No explicit next step was agreed." },
+    discovery: { title: "Discovery", score: 2, feedback: "No discovery question was asked.", evidence: [] },
+    objectionHandling: { title: "Objection Handling", score: 3, feedback: "The objection was acknowledged briefly.", evidence: [] },
+    listening: { title: "Listening", score: 5, feedback: "The response referenced the customer's concern.", evidence: [] },
+    communication: { title: "Communication", score: 10, feedback: "The opening was concise and understandable.", evidence: [] },
+    closing: { title: "Closing", score: 5, feedback: "No explicit next step was agreed.", evidence: [] },
     continuationAdvice:
       "Acknowledge the concern and ask one clear question before moving on.",
-    strengths: ["Opened the conversation clearly."],
-    missedOpportunities: ["Did not ask a discovery question."],
-    recommendedImprovements: ["Ask an open discovery question before presenting."],
+    strengths: [{ title: "Clear opening", feedback: "Opened the conversation clearly.", evidence: [] }],
+    missedOpportunities: [{ title: "Discovery", feedback: "Did not ask a discovery question.", evidence: [], betterResponse: "What matters most to you?" }],
+    recommendedImprovements: [{ title: "Ask first", feedback: "Ask an open discovery question before presenting.", evidence: [], betterResponse: "What would you like to improve?" }],
     callSummary: {
       endedBy: "representative",
       endReason: "The sales representative chose to end the call.",
@@ -49,6 +55,7 @@ vi.mock("@/infrastructure/evaluation", () => evaluationMocks);
 import { POST as evaluate } from "@/app/api/evaluations/route";
 import { POST as createSession } from "@/app/api/roleplay-sessions/route";
 import { GET as listScenarios } from "@/app/api/scenarios/route";
+import { resolveCustomerVoice } from "@/infrastructure/gemini/customer-voice";
 
 describe("API routes", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -59,7 +66,7 @@ describe("API routes", () => {
       catalog: { categories: unknown[]; difficulties: unknown[] };
     };
     expect(response.status).toBe(200);
-    expect(body.catalog.categories).toHaveLength(4);
+    expect(body.catalog.categories).toHaveLength(11);
     expect(body.catalog.difficulties).toHaveLength(4);
     expect(JSON.stringify(body)).not.toContain("Missed service levels cost");
     expect(JSON.stringify(body)).not.toContain("skepticism");
@@ -73,6 +80,7 @@ describe("API routes", () => {
         body: JSON.stringify({
           categoryId: "insurance",
           archetypeId: "new-parent",
+          scenarioId: "comparing-options",
           difficulty: "hard",
         }),
       }),
@@ -84,8 +92,64 @@ describe("API routes", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(body.ephemeralToken).toBe("ephemeral-test-token");
-    expect(body.scenario.id).toBe("insurance--new-parent--hard");
+    expect(response.headers.get("x-customer-voice")).toBe(
+      resolveCustomerVoice("new-parent"),
+    );
+    expect(liveSessionMocks.provisionLiveSession.mock.calls[0]?.[1]).toBe(
+      response.headers.get("x-customer-voice"),
+    );
+    expect(body.scenario.id).toBe("insurance--new-parent--comparing-options--hard");
     expect(body.scenario.difficulty).toBe("hard");
+  });
+
+  it("keeps legacy session requests compatible by selecting the profile default", async () => {
+    const response = await createSession(
+      new Request("http://localhost/api/roleplay-sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          categoryId: "insurance",
+          archetypeId: "new-parent",
+          difficulty: "easy",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      scenario: { profileScenarioId: string };
+    };
+    expect(response.status).toBe(200);
+    expect(body.scenario.profileScenarioId).toBe("initial-needs-conversation");
+  });
+
+  it("carries context into a follow-up session", async () => {
+    const response = await createSession(
+      new Request("http://localhost/api/roleplay-sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          categoryId: "b2b-saas",
+          archetypeId: "startup-founder",
+          scenarioId: "decision-follow-up",
+          difficulty: "medium",
+          followUpContext: {
+            lastConversationSummary: "We reviewed the workflow.",
+            agreedNextSteps: "A security brief would be sent.",
+            previousConversationTime: "yesterday",
+            additionalNotes: "",
+          },
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      scenario: {
+        followUpContext?: { lastConversationSummary: string };
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.scenario.followUpContext?.lastConversationSummary).toBe(
+      "We reviewed the workflow.",
+    );
   });
 
   it("rejects unknown scenarios before calling Gemini", async () => {

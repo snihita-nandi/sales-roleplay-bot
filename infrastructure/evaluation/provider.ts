@@ -16,10 +16,36 @@ export const EVALUATION_ATTEMPT_TIMEOUT_MS = 15_000;
 const dimensionJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["score", "evidence"],
+  required: ["title", "score", "feedback", "evidence"],
   properties: {
+    title: { type: "string" },
     score: { type: "integer", minimum: 0, maximum: 20 },
-    evidence: { type: "string" },
+    feedback: { type: "string" },
+    evidence: {
+      type: "array",
+      maxItems: 5,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["transcriptIndex", "speaker", "shortQuote", "explanation"],
+        properties: {
+          transcriptIndex: { type: "integer", minimum: 0, maximum: 499 },
+          speaker: { type: "string", enum: ["user", "customer"] },
+          shortQuote: { type: "string" },
+          explanation: { type: "string" },
+        },
+      },
+    },
+  },
+} as const;
+
+const feedbackItemJsonSchema = {
+  ...dimensionJsonSchema,
+  required: ["title", "feedback", "evidence"],
+  properties: {
+    ...dimensionJsonSchema.properties,
+    score: { type: "integer", minimum: 0, maximum: 20 },
+    betterResponse: { type: "string" },
   },
 } as const;
 
@@ -46,16 +72,21 @@ export const evaluationJsonSchema = {
     communication: dimensionJsonSchema,
     closing: dimensionJsonSchema,
     continuationAdvice: { type: "string" },
-    strengths: { type: "array", items: { type: "string" }, minItems: 0, maxItems: 5 },
+    strengths: {
+      type: "array",
+      items: feedbackItemJsonSchema,
+      minItems: 0,
+      maxItems: 5,
+    },
     missedOpportunities: {
       type: "array",
-      items: { type: "string" },
+      items: feedbackItemJsonSchema,
       minItems: 1,
       maxItems: 5,
     },
     recommendedImprovements: {
       type: "array",
-      items: { type: "string" },
+      items: feedbackItemJsonSchema,
       minItems: 1,
       maxItems: 5,
     },
@@ -77,7 +108,10 @@ export function buildEvaluationPrompt(
 ): string {
   const transcript =
     request.transcript
-      .map((entry) => `[${entry.timestampMs}ms] ${entry.role}: ${entry.text}`)
+      .map(
+        (entry, index) =>
+          `[${index}] ${entry.role === "representative" ? "user" : "customer"} (${entry.timestampMs}ms): ${entry.text}`,
+      )
       .join("\n") || "No transcript was captured.";
 
   return `
@@ -102,17 +136,17 @@ ${transcript}
 Return only a JSON object with exactly this structure and no additional keys:
 {
   "summary": "Concise overall assessment",
-  "discovery": { "score": 0, "evidence": "Transcript-grounded evidence" },
-  "objectionHandling": { "score": 0, "evidence": "Transcript-grounded evidence" },
-  "listening": { "score": 0, "evidence": "Transcript-grounded evidence" },
-  "communication": { "score": 0, "evidence": "Transcript-grounded evidence" },
-  "closing": { "score": 0, "evidence": "Transcript-grounded evidence" },
+  "discovery": { "title": "Discovery", "score": 0, "feedback": "Assessment", "evidence": [{ "transcriptIndex": 0, "speaker": "user", "shortQuote": "Exact short quote", "explanation": "Why this supports the assessment" }] },
+  "objectionHandling": { "title": "Objection Handling", "score": 0, "feedback": "Assessment", "evidence": [] },
+  "listening": { "title": "Listening", "score": 0, "feedback": "Assessment", "evidence": [] },
+  "communication": { "title": "Communication", "score": 0, "feedback": "Assessment", "evidence": [] },
+  "closing": { "title": "Closing", "score": 0, "feedback": "Assessment", "evidence": [] },
   "continuationAdvice": "A simple, practical explanation of what the representative could have said or done to keep the customer in the conversation",
-  "strengths": ["Concrete transcript-grounded strength"],
-  "missedOpportunities": ["Concrete missed opportunity"],
-  "recommendedImprovements": ["Concrete recommended improvement"]
+  "strengths": [{ "title": "Specific strength", "feedback": "What happened and why it worked", "evidence": [{ "transcriptIndex": 0, "speaker": "user", "shortQuote": "Exact short quote", "explanation": "Why this mattered" }] }],
+  "missedOpportunities": [{ "title": "Specific missed opportunity", "feedback": "What happened and why it could be improved", "evidence": [], "betterResponse": "An example of a stronger response" }],
+  "recommendedImprovements": [{ "title": "Specific improvement", "feedback": "What happened and why it could be improved", "evidence": [], "betterResponse": "An example of a stronger response" }]
 }
-Each score must be an integer from 0 to 20. If evidence is absent, say so and score accordingly. Strengths may be an empty array when the transcript contains no defensible positive evidence; never invent a strength. Use simple, natural English throughout. The continuationAdvice must explain how the representative could have kept the customer talking, not merely repeat why the call ended. Ground it in the transcript and the stated ending. Do not invent dialogue or facts. Do not include an overall score or call summary; the application calculates those from trusted call data.
+Transcript indices are zero-based and shown in square brackets. The representative is named "user" in evidence. Every evidence quote must be a short, exact substring of the transcript message at transcriptIndex, and its speaker must match that message. Never fabricate, paraphrase, or combine quotes. Use an empty evidence array when the transcript does not support a claim. Strengths may be empty when there is no defensible positive evidence. Every improvement should explain what happened, why it could be improved, and include a practical betterResponse. Each score must be an integer from 0 to 20 and use the existing rubric exactly. Use simple, natural English throughout. The continuationAdvice must explain how the representative could have kept the customer talking, not merely repeat why the call ended. Ground it in the transcript and the stated ending. Do not invent dialogue or facts. Do not include an overall score or call summary; the application calculates those from trusted call data.
 `.trim();
 }
 
@@ -137,7 +171,41 @@ export function parseEvaluationResult(
   request: EvaluationRequest,
 ): EvaluationResult {
   const result = evaluationModelResponseSchema.parse(JSON.parse(responseText) as unknown);
-  return addOverallScore(result, request);
+  return addOverallScore(groundEvaluationEvidence(result, request), request);
+}
+
+function groundEvaluationEvidence(
+  result: EvaluationModelResponse,
+  request: EvaluationRequest,
+): EvaluationModelResponse {
+  const groundItem = <
+    T extends { evidence: EvaluationModelResponse["discovery"]["evidence"] },
+  >(
+    item: T,
+  ): T => ({
+    ...item,
+    evidence: item.evidence.filter((evidence) => {
+      const transcriptEntry = request.transcript[evidence.transcriptIndex];
+      if (!transcriptEntry) return false;
+      const expectedRole = evidence.speaker === "user" ? "representative" : "customer";
+      return (
+        transcriptEntry.role === expectedRole &&
+        transcriptEntry.text.includes(evidence.shortQuote)
+      );
+    }),
+  });
+
+  return {
+    ...result,
+    discovery: groundItem(result.discovery),
+    objectionHandling: groundItem(result.objectionHandling),
+    listening: groundItem(result.listening),
+    communication: groundItem(result.communication),
+    closing: groundItem(result.closing),
+    strengths: result.strengths.map(groundItem),
+    missedOpportunities: result.missedOpportunities.map(groundItem),
+    recommendedImprovements: result.recommendedImprovements.map(groundItem),
+  };
 }
 
 export async function withEvaluationRetries<T>(

@@ -8,8 +8,11 @@ import type { CustomerScenario } from "@/domain/scenarios/schema";
 import { compileCustomerPrompt } from "@/domain/scenarios/prompt";
 import { createServerGeminiClient } from "@/infrastructure/gemini/client";
 import {
+  createCustomerSpeechConfig,
+  type CustomerVoice,
+} from "@/infrastructure/gemini/customer-voice";
+import {
   GEMINI_LIVE_MODEL,
-  GEMINI_VOICE,
   LIVE_TOKEN_LIFETIME_MS,
   LIVE_TOKEN_START_WINDOW_MS,
 } from "@/infrastructure/gemini/constants";
@@ -22,6 +25,7 @@ export interface ProvisionedLiveSession {
 
 export async function provisionLiveSession(
   scenario: CustomerScenario,
+  voiceName: CustomerVoice,
 ): Promise<ProvisionedLiveSession> {
   const client = createServerGeminiClient("v1alpha");
   const now = Date.now();
@@ -41,11 +45,7 @@ export async function provisionLiveSession(
           systemInstruction,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: GEMINI_VOICE },
-            },
-          },
+          speechConfig: createCustomerSpeechConfig(voiceName),
           realtimeInputConfig: {
             automaticActivityDetection: {
               disabled: false,

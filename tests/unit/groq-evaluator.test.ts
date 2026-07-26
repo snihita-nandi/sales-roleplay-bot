@@ -42,16 +42,21 @@ const request: EvaluationRequest = {
 
 const modelResponse: EvaluationModelResponse = {
   summary: "The representative asked one useful question.",
-  discovery: { score: 12, evidence: "Asked what matters most." },
-  objectionHandling: { score: 0, evidence: "No objection occurred." },
-  listening: { score: 5, evidence: "There was no customer response to follow." },
-  communication: { score: 12, evidence: "The question was concise." },
-  closing: { score: 0, evidence: "No next step was discussed." },
+  discovery: {
+    title: "Discovery",
+    score: 12,
+    feedback: "Asked what matters most.",
+    evidence: [{ transcriptIndex: 0, speaker: "user", shortQuote: "What matters most?", explanation: "This was an open discovery question." }],
+  },
+  objectionHandling: { title: "Objection Handling", score: 0, feedback: "No objection occurred.", evidence: [] },
+  listening: { title: "Listening", score: 5, feedback: "There was no customer response to follow.", evidence: [] },
+  communication: { title: "Communication", score: 12, feedback: "The question was concise.", evidence: [] },
+  closing: { title: "Closing", score: 0, feedback: "No next step was discussed.", evidence: [] },
   continuationAdvice:
     "Wait for the customer's answer and ask a useful follow-up question.",
-  strengths: ["Asked an open question."],
-  missedOpportunities: ["The call ended before follow-up discovery."],
-  recommendedImprovements: ["Continue with a relevant follow-up question."],
+  strengths: [{ title: "Open question", feedback: "Asked an open question.", evidence: [{ transcriptIndex: 0, speaker: "user", shortQuote: "What matters most?", explanation: "This invited discovery." }] }],
+  missedOpportunities: [{ title: "Early ending", feedback: "The call ended before follow-up discovery.", evidence: [], betterResponse: "Tell me more about that." }],
+  recommendedImprovements: [{ title: "Follow up", feedback: "Continue with a relevant follow-up question.", evidence: [], betterResponse: "What would a good outcome look like?" }],
 };
 
 describe("Groq evaluator", () => {

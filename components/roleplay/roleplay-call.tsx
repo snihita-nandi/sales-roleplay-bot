@@ -49,7 +49,8 @@ export function RoleplayCall({ scenario, onBack, onComplete }: RoleplayCallProps
         </button>
         <p className="mt-12 text-xs font-bold uppercase tracking-[0.18em] text-lime-300">Your briefing</p>
         <p className="mt-4 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
-          {scenario.categoryName} · {scenario.archetypeName} · {scenario.difficultyLabel}
+          {scenario.categoryName} · {scenario.archetypeName} · {scenario.profileScenarioName} ·{" "}
+          {scenario.difficultyLabel}
         </p>
         <h1 className="mt-3 text-3xl font-semibold tracking-tight">{scenario.title}</h1>
         <p className="mt-4 text-[15px] leading-7 text-slate-300">{scenario.summary}</p>
@@ -62,6 +63,10 @@ export function RoleplayCall({ scenario, onBack, onComplete }: RoleplayCallProps
           <div>
             <dt className="text-xs uppercase tracking-[0.16em] text-slate-500">Objective</dt>
             <dd className="mt-2 text-sm leading-6 text-slate-200">{scenario.objective}</dd>
+          </div>
+          <div>
+            <dt className="text-xs uppercase tracking-[0.16em] text-slate-500">Why today</dt>
+            <dd className="mt-2 text-sm leading-6 text-slate-200">{scenario.reasonForCall}</dd>
           </div>
           <div>
             <dt className="text-xs uppercase tracking-[0.16em] text-slate-500">Prospect</dt>

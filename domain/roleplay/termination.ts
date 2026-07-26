@@ -29,13 +29,39 @@ export const callTerminationSchema = z
 
 const customerEndCallMarkerSchema = z
   .object({
-    endedBy: z.string().trim().min(1),
-    reason: z.string().trim().min(1).max(300),
+    endedBy: z.string().trim().min(1).optional(),
+    reason: z.string().trim().min(1).max(300).optional(),
     category: z.string().trim().min(1),
   })
   .passthrough();
 
 export type CallTermination = z.infer<typeof callTerminationSchema>;
+
+const customerEndReasons: Record<
+  z.infer<typeof customerEndCategorySchema>,
+  string
+> = {
+  confusion: "Customer ended the call because the conversation remained unclear.",
+  busy: "Customer ended the call because they needed to return to other priorities.",
+  "wrong-person": "Customer ended the call because they were not the appropriate contact.",
+  "loss-of-trust": "Customer ended the call because they no longer trusted the conversation.",
+  "loss-of-interest": "Customer ended the call because they were no longer interested in continuing.",
+  other: "Customer chose to end the call.",
+};
+
+export function createCustomerTermination(categoryInput: unknown): CallTermination | null {
+  const parsedCategory = customerEndCategorySchema.safeParse(
+    typeof categoryInput === "string"
+      ? categoryInput.toLowerCase().replaceAll("_", "-")
+      : categoryInput,
+  );
+  if (!parsedCategory.success) return null;
+  return {
+    endedBy: "customer",
+    endReason: customerEndReasons[parsedCategory.data],
+    endCategory: parsedCategory.data,
+  };
+}
 
 export interface ParsedCustomerTerminationOutput {
   visibleText: string;
@@ -76,20 +102,17 @@ export function parseCustomerTerminationOutput(
     const parsed = customerEndCallMarkerSchema.parse(
       JSON.parse(output.slice(jsonStart, jsonEnd)) as unknown,
     );
-    const endedBy = parsed.endedBy.toLowerCase();
-    const category = customerEndCategorySchema.parse(
-      parsed.category.toLowerCase().replaceAll("_", "-"),
-    );
+    const endedBy = parsed.endedBy?.toLowerCase() ?? "customer";
+    const termination = createCustomerTermination(parsed.category);
     if (endedBy !== "customer") {
+      return { visibleText, termination: null, markerFound: true, status: "invalid" };
+    }
+    if (!termination) {
       return { visibleText, termination: null, markerFound: true, status: "invalid" };
     }
     return {
       visibleText,
-      termination: {
-        endedBy: "customer",
-        endReason: parsed.reason,
-        endCategory: category,
-      },
+      termination,
       markerFound: true,
       status: "valid",
     };

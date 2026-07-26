@@ -12,22 +12,64 @@ import type {
   RoleplayTransportCallbacks,
   TranscriptEntry,
 } from "@/domain/roleplay/types";
-import { parseCustomerTerminationOutput } from "@/domain/roleplay/termination";
+import {
+  createCustomerTermination,
+  parseCustomerTerminationOutput,
+  type CallTermination,
+} from "@/domain/roleplay/termination";
 import { UserTranscriptSegmenter } from "@/domain/roleplay/user-transcript-segmenter";
 import type { RoleplaySessionResponse } from "@/domain/roleplay/api";
+import { FarewellDrain } from "@/infrastructure/gemini/farewell-drain";
+import { createCustomerSpeechConfig } from "@/infrastructure/gemini/customer-voice";
+import type { CustomerVoice } from "@/infrastructure/gemini/customer-voice";
+import {
+  acceptsCustomerOutput,
+  acceptsMicrophoneInput,
+  completeCustomerEnding,
+  enterCustomerEnding,
+  type LiveConversationState,
+} from "@/infrastructure/gemini/conversation-state";
+import {
+  createRoleplayTools,
+  END_ROLEPLAY_TOOL_NAME,
+} from "@/infrastructure/gemini/live-tools";
+import {
+  isMeaningfulSalespersonSpeech,
+  OpeningSilenceController,
+} from "@/infrastructure/gemini/opening-silence";
 
 const INPUT_SAMPLE_RATE = 16_000;
 const OUTPUT_SAMPLE_RATE = 24_000;
 const PROCESSOR_NAME = "roleplay-pcm-capture";
-const CUSTOMER_DISCONNECT_GRACE_MS = 2_500;
-
-type ConversationState = "active" | "ending" | "ended";
 type TranscriptEventType =
   | "user-interim"
   | "user-transcription"
   | "assistant-transcription"
   | "assistant-turn-complete"
   | "assistant-termination-complete";
+
+export function createCustomerOpenerInstruction(
+  scenario: RoleplaySessionResponse["scenario"],
+): string {
+  if (scenario.profileScenarioId === "decision-follow-up") {
+    return "The salesperson has been silent for five seconds. Generate exactly one short, natural customer opener now. Acknowledge that this is a follow-up and naturally remember the previous interaction; use any follow-up context as memory without quoting notes word-for-word. Do not end the call.";
+  }
+  if (scenario.profileScenarioId === "comparing-options") {
+    return "The salesperson has been silent for five seconds. Generate exactly one short, natural customer opener now that asks who is calling or what this is regarding. Remain consistent with already having a provider. Do not end the call.";
+  }
+  return "The salesperson has been silent for five seconds. Generate exactly one short, natural customer opener now, such as asking who is calling. Remain consistent with being a first-time buyer. Do not end the call.";
+}
+
+const SILENCE_GOODBYE_INSTRUCTION =
+  "The salesperson did not respond after your opener. Speak exactly one concise, natural goodbye in character, finish it completely, then silently call end_roleplay with category other. Do not say or explain the end reason.";
+
+export function createBrowserLiveConfig(voiceName: string) {
+  return {
+    responseModalities: [Modality.AUDIO],
+    speechConfig: createCustomerSpeechConfig(voiceName),
+    tools: createRoleplayTools(),
+  };
+}
 
 interface AssistantTranscriptBuffer {
   id: string;
@@ -90,16 +132,19 @@ class PcmAudioPlayer {
   private context: AudioContext | null = null;
   private nextStartTime = 0;
   private pendingPlays = 0;
+  private playbackGeneration = 0;
   private readonly activeSources = new Set<AudioBufferSourceNode>();
   private readonly idleResolvers = new Set<() => void>();
 
   async play(base64: string): Promise<void> {
+    const generation = this.playbackGeneration;
     this.pendingPlays += 1;
     try {
       this.context ??= new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
       if (this.context.state === "suspended") {
         await this.context.resume();
       }
+      if (generation !== this.playbackGeneration) return;
 
       const samples = decodePcm16(base64);
       if (samples.length === 0) return;
@@ -125,6 +170,7 @@ class PcmAudioPlayer {
   }
 
   interrupt(): void {
+    this.playbackGeneration += 1;
     for (const source of this.activeSources) {
       try {
         source.stop();
@@ -168,10 +214,9 @@ export class GeminiLiveTransport implements RoleplayTransport {
   private closeNotified = false;
   private customerTerminationRequested = false;
   private terminationParseFailureLogged = false;
-  private customerFinalOutputReceived = false;
   private customerRawTranscript = "";
-  private conversationState: ConversationState = "active";
-  private customerDisconnectTimer: number | null = null;
+  private conversationState: LiveConversationState = "active";
+  private farewellDrain: FarewellDrain | null = null;
   private assistantTurnSequence = 0;
   private assistantTranscript = this.createAssistantTranscriptBuffer();
   private readonly emittedTranscriptIds = new Set<string>();
@@ -180,11 +225,26 @@ export class GeminiLiveTransport implements RoleplayTransport {
     createId: () => crypto.randomUUID(),
     now: () => performance.now(),
   });
+  private readonly openingSilence: OpeningSilenceController;
   constructor(
     private readonly bootstrap: RoleplaySessionResponse,
+    private readonly voiceName: CustomerVoice,
     private readonly stream: MediaStream,
     private readonly callbacks: RoleplayTransportCallbacks,
-  ) {}
+  ) {
+    this.openingSilence = new OpeningSilenceController({
+      requestCustomerOpener: () => {
+        if (this.closed || this.conversationState !== "active" || !this.session) return;
+        this.session.sendClientContent({
+          turns: createCustomerOpenerInstruction(this.bootstrap.scenario),
+          turnComplete: true,
+        });
+      },
+      requestSilenceGoodbye: () => this.requestSilenceGoodbye(),
+      setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+      clearTimer: (timer) => clearTimeout(timer),
+    });
+  }
 
   async connect(): Promise<void> {
     const client = new GoogleGenAI({
@@ -194,16 +254,20 @@ export class GeminiLiveTransport implements RoleplayTransport {
 
     this.session = await client.live.connect({
       model: this.bootstrap.model,
-      config: { responseModalities: [Modality.AUDIO] },
+      config: createBrowserLiveConfig(this.voiceName),
       callbacks: {
         onmessage: (message) => this.handleMessage(message),
-        onerror: () => this.callbacks.onError("The live audio connection encountered an error."),
+        onerror: () => {
+          this.openingSilence.stop();
+          this.callbacks.onError("The live audio connection encountered an error.");
+        },
         onclose: () => this.notifyClosed(),
       },
     });
 
     await this.startCapture();
     this.callbacks.onConnected();
+    this.openingSilence.callReady();
   }
 
   setMuted(muted: boolean): void {
@@ -221,11 +285,11 @@ export class GeminiLiveTransport implements RoleplayTransport {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.conversationState = "ended";
-    if (this.customerDisconnectTimer !== null) {
-      window.clearTimeout(this.customerDisconnectTimer);
-      this.customerDisconnectTimer = null;
-    }
+    this.openingSilence.stop();
+    this.conversationState =
+      this.conversationState === "ending"
+        ? completeCustomerEnding(this.conversationState)
+        : "ended";
     this.captureNode?.disconnect();
     this.captureSource?.disconnect();
     this.silentGain?.disconnect();
@@ -264,7 +328,7 @@ export class GeminiLiveTransport implements RoleplayTransport {
     this.silentGain.gain.value = 0;
     this.captureNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
       if (
-        this.conversationState !== "active" ||
+        !acceptsMicrophoneInput(this.conversationState) ||
         this.muted ||
         this.closed ||
         !this.session
@@ -284,12 +348,19 @@ export class GeminiLiveTransport implements RoleplayTransport {
   private handleMessage(message: LiveServerMessage): void {
     if (
       message.data &&
-      this.conversationState !== "ended" &&
-      !this.customerFinalOutputReceived
+      acceptsCustomerOutput(this.conversationState)
     ) {
       void this.player.play(message.data).catch(() => {
         this.callbacks.onError("Customer audio could not be played.");
       });
+    }
+
+    const endCall = message.toolCall?.functionCalls?.find(
+      (functionCall) => functionCall.name === END_ROLEPLAY_TOOL_NAME,
+    );
+    if (endCall) {
+      const termination = createCustomerTermination(endCall.args?.category);
+      if (termination) this.requestCustomerEnding(termination, true);
     }
 
     const content = message.serverContent;
@@ -302,6 +373,9 @@ export class GeminiLiveTransport implements RoleplayTransport {
       this.conversationState === "active" &&
       content.interimInputTranscription?.text
     ) {
+      this.registerMeaningfulSalespersonSpeech(
+        content.interimInputTranscription.text,
+      );
       this.emitTranscript(
         this.userTranscript.updateDraft(content.interimInputTranscription.text),
         "user-interim",
@@ -309,6 +383,7 @@ export class GeminiLiveTransport implements RoleplayTransport {
     }
     if (this.conversationState === "active" && content.inputTranscription) {
       const inputTranscript = content.inputTranscription;
+      this.registerMeaningfulSalespersonSpeech(inputTranscript.text ?? "");
       const entry =
         inputTranscript.finished === false
           ? this.userTranscript.updateDraft(inputTranscript.text ?? "")
@@ -322,31 +397,32 @@ export class GeminiLiveTransport implements RoleplayTransport {
         outputFinished,
       );
       if (this.conversationState === "ending" && outputFinished) {
-        this.scheduleCustomerDisconnect();
+        this.farewellDrain?.markOutputComplete();
       }
     }
     if (content.turnComplete) {
       if (this.conversationState === "ending") {
-        this.scheduleCustomerDisconnect();
+        this.farewellDrain?.markOutputComplete();
       } else if (this.conversationState === "active") {
         this.logIncompleteTerminationMarker();
         this.finalizeAssistantTurn("assistant-turn-complete");
+        void this.player.whenIdle().then(() => {
+          if (this.closed || this.conversationState !== "active") return;
+          this.openingSilence.customerOpenerPlaybackComplete();
+        });
       }
     }
   }
 
   private updateCustomerTranscript(chunk: string, final: boolean): void {
-    if (this.customerTerminationRequested) return;
     this.customerRawTranscript += chunk;
     const parsed = parseCustomerTerminationOutput(this.customerRawTranscript);
     const buffer = this.assistantTranscript;
     buffer.text = parsed.visibleText;
 
     if (parsed.termination) {
-      this.customerTerminationRequested = true;
       this.customerRawTranscript = "";
-      this.beginCustomerEnding();
-      this.callbacks.onCustomerEnded(parsed.termination);
+      this.requestCustomerEnding(parsed.termination, final);
       return;
     }
 
@@ -386,32 +462,44 @@ export class GeminiLiveTransport implements RoleplayTransport {
   }
 
   private beginCustomerEnding(): void {
-    if (this.conversationState !== "active") return;
-    this.conversationState = "ending";
+    this.conversationState = enterCustomerEnding(this.conversationState);
     this.muted = true;
-    if (this.captureNode) this.captureNode.port.onmessage = null;
-    for (const track of this.stream.getAudioTracks()) track.enabled = false;
+    this.openingSilence.stop();
   }
 
-  private scheduleCustomerDisconnect(): void {
-    if (
-      this.conversationState !== "ending" ||
-      this.customerFinalOutputReceived ||
-      this.customerDisconnectTimer !== null
-    ) {
-      return;
-    }
+  private registerMeaningfulSalespersonSpeech(text: string): void {
+    if (!isMeaningfulSalespersonSpeech(text)) return;
+    this.openingSilence.meaningfulSalespersonSpeech();
+  }
 
-    this.customerFinalOutputReceived = true;
-    void this.player.whenIdle().then(() => {
-      if (this.conversationState !== "ending" || this.closed) return;
-      this.customerDisconnectTimer = window.setTimeout(() => {
-        this.customerDisconnectTimer = null;
+  private requestSilenceGoodbye(): void {
+    if (this.closed || this.conversationState !== "active" || !this.session) return;
+    const termination = createCustomerTermination("other");
+    if (!termination) return;
+    this.requestCustomerEnding(termination, false);
+    this.session?.sendClientContent({
+      turns: SILENCE_GOODBYE_INSTRUCTION,
+      turnComplete: true,
+    });
+  }
+
+  private requestCustomerEnding(
+    termination: CallTermination,
+    outputComplete: boolean,
+  ): void {
+    if (this.conversationState !== "active" || this.customerTerminationRequested) return;
+    this.customerTerminationRequested = true;
+    this.beginCustomerEnding();
+    this.callbacks.onCustomerEnded(termination);
+    this.farewellDrain = new FarewellDrain();
+    if (outputComplete) this.farewellDrain.markOutputComplete();
+    void this.farewellDrain
+      .waitUntilSafeToDisconnect(() => this.player.whenIdle())
+      .then(() => {
         if (this.conversationState !== "ending" || this.closed) return;
         this.finalizeAssistantTurn("assistant-termination-complete");
         void this.close();
-      }, CUSTOMER_DISCONNECT_GRACE_MS);
-    });
+      });
   }
 
   private emitTranscript(

@@ -122,6 +122,7 @@ export function RoleplayApp({ initialCatalog }: RoleplayAppProps) {
         <EvaluationResults
           scenario={selectedScenario}
           evaluation={evaluation}
+          transcript={completedRoleplay?.transcript ?? []}
           loading={evaluationLoading}
           error={evaluationError}
           onRetry={() => {

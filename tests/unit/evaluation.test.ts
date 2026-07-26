@@ -11,6 +11,7 @@ vi.mock("@google/genai", () => ({
 import { defaultRubric } from "@/config/rubrics/default";
 import { scenarioRegistry } from "@/config/scenarios";
 import type { EvaluationModelResponse, EvaluationRequest } from "@/domain/evaluation/schema";
+import { parseCustomerTerminationOutput } from "@/domain/roleplay/termination";
 import { GeminiEvaluator } from "@/infrastructure/evaluation/gemini-evaluator";
 import {
   buildEvaluationPrompt,
@@ -42,16 +43,40 @@ const request: EvaluationRequest = {
 
 export const modelResponse: EvaluationModelResponse = {
   summary: "The representative opened with a relevant question but did not earn a next step.",
-  discovery: { score: 15, evidence: "Asked what concerned the customer most." },
-  objectionHandling: { score: 10, evidence: "The cost concern was heard but not explored." },
-  listening: { score: 12, evidence: "The question invited the customer's concern." },
-  communication: { score: 14, evidence: "The question was concise and clear." },
-  closing: { score: 4, evidence: "No next step appears in the transcript." },
+  discovery: {
+    title: "Discovery",
+    score: 15,
+    feedback: "Asked what concerned the customer most.",
+    evidence: [{ transcriptIndex: 0, speaker: "user", shortQuote: "What concerns you most?", explanation: "This invited the customer to state a priority." }],
+  },
+  objectionHandling: {
+    title: "Objection Handling",
+    score: 10,
+    feedback: "The cost concern was heard but not explored.",
+    evidence: [{ transcriptIndex: 1, speaker: "customer", shortQuote: "worried about the cost", explanation: "This was a clear price concern." }],
+  },
+  listening: { title: "Listening", score: 12, feedback: "The question invited the customer's concern.", evidence: [] },
+  communication: { title: "Communication", score: 14, feedback: "The question was concise and clear.", evidence: [] },
+  closing: { title: "Closing", score: 4, feedback: "No next step appears in the transcript.", evidence: [] },
   continuationAdvice:
     "Acknowledge the cost concern and ask one simple follow-up question before suggesting a next step.",
-  strengths: ["Opened with a relevant question."],
-  missedOpportunities: ["Did not explore the cost concern."],
-  recommendedImprovements: ["Ask what makes the expected cost difficult."],
+  strengths: [{
+    title: "Relevant opening",
+    feedback: "Opened with a relevant question.",
+    evidence: [{ transcriptIndex: 0, speaker: "user", shortQuote: "What concerns you most?", explanation: "The open question invited discovery." }],
+  }],
+  missedOpportunities: [{
+    title: "Cost discovery",
+    feedback: "Did not explore the cost concern.",
+    evidence: [{ transcriptIndex: 1, speaker: "customer", shortQuote: "worried about the cost", explanation: "The concern created an opening for follow-up." }],
+    betterResponse: "What part of the cost concerns you most?",
+  }],
+  recommendedImprovements: [{
+    title: "Explore the objection",
+    feedback: "Ask what makes the expected cost difficult.",
+    evidence: [{ transcriptIndex: 1, speaker: "customer", shortQuote: "worried about the cost", explanation: "A follow-up should address this concern." }],
+    betterResponse: "Could you share what budget you had in mind?",
+  }],
 };
 
 describe("shared evaluation contract", () => {
@@ -59,13 +84,34 @@ describe("shared evaluation contract", () => {
     const prompt = buildEvaluationPrompt(scenario, defaultRubric, request);
     expect(prompt).toContain("customer roleplay has ended");
     expect(prompt).toContain("Completed transcript:");
-    expect(prompt).toContain("representative: What concerns you most?");
+    expect(prompt).toContain("[0] user (1000ms): What concerns you most?");
     expect(prompt).toContain("Do not invent dialogue or facts");
-    expect(prompt).toContain("Strengths may be an empty array");
+    expect(prompt).toContain("Strengths may be empty");
     expect(prompt).toContain("Customer lost interest during the conversation");
     expect(prompt).toContain("could have kept the customer talking");
-    expect(prompt).toContain('"discovery": { "score": 0, "evidence"');
+    expect(prompt).toContain('"discovery": { "title": "Discovery", "score": 0');
     expect(prompt).toContain("no additional keys");
+  });
+
+  it("removes evidence that does not exactly match the referenced transcript entry", () => {
+    const result = parseEvaluationResult(
+      JSON.stringify({
+        ...modelResponse,
+        strengths: [{
+          title: "Invented evidence",
+          feedback: "This claim is not grounded.",
+          evidence: [{
+            transcriptIndex: 0,
+            speaker: "user",
+            shortQuote: "A sentence that was never said.",
+            explanation: "Unsupported.",
+          }],
+        }],
+      }),
+      request,
+    );
+
+    expect(result.strengths[0]?.evidence).toEqual([]);
   });
 
   it("classifies provider capacity and timeouts as retryable", () => {
@@ -92,6 +138,34 @@ describe("shared evaluation contract", () => {
       durationSeconds: 45,
       conversationTurns: 2,
     });
+  });
+
+  it("keeps customer end metadata out of dialogue while preserving the report reason", () => {
+    const parsedEnding = parseCustomerTerminationOutput(
+      'Thanks for your time. I will think about it. <END_CALL>{"category":"other"}</END_CALL>',
+    );
+    if (!parsedEnding.termination) throw new Error("Expected a customer termination.");
+    const completedRequest: EvaluationRequest = {
+      ...request,
+      transcript: [
+        request.transcript[0],
+        {
+          role: "customer",
+          text: parsedEnding.visibleText,
+          timestampMs: 2_000,
+        },
+      ],
+      termination: parsedEnding.termination,
+    };
+
+    const result = parseEvaluationResult(JSON.stringify(modelResponse), completedRequest);
+    expect(completedRequest.transcript.map((entry) => entry.text)).toEqual([
+      "What concerns you most?",
+      "Thanks for your time. I will think about it.",
+    ]);
+    expect(JSON.stringify(completedRequest.transcript)).not.toContain("END_CALL");
+    expect(JSON.stringify(completedRequest.transcript)).not.toContain("Customer chose to end");
+    expect(result.callSummary.endReason).toBe("Customer chose to end the call.");
   });
 });
 

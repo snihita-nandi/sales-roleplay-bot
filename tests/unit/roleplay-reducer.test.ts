@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { createInitialRoleplayState, getCallMetrics, roleplayReducer } from "@/domain/roleplay/reducer";
-import { parseCustomerTerminationOutput } from "@/domain/roleplay/termination";
+import {
+  createCustomerTermination,
+  parseCustomerTerminationOutput,
+} from "@/domain/roleplay/termination";
 import type { RoleplayState } from "@/domain/roleplay/types";
 
 describe("roleplay reducer", () => {
@@ -235,6 +238,15 @@ describe("roleplay reducer", () => {
 });
 
 describe("customer termination marker", () => {
+  it("creates silent termination metadata from an out-of-band tool category", () => {
+    expect(createCustomerTermination("loss-of-interest")).toEqual({
+      endedBy: "customer",
+      endReason: "Customer ended the call because they were no longer interested in continuing.",
+      endCategory: "loss-of-interest",
+    });
+    expect(createCustomerTermination("not-a-category")).toBeNull();
+  });
+
   it("withholds a partial marker from the visible customer transcript", () => {
     const parsed = parseCustomerTerminationOutput("I need to get back to work. <END_");
 
@@ -251,7 +263,7 @@ describe("customer termination marker", () => {
     expect(parsed.visibleText).not.toContain("END_CALL");
     expect(parsed.termination).toEqual({
       endedBy: "customer",
-      endReason: "Customer was busy and chose to end the call.",
+      endReason: "Customer ended the call because they needed to return to other priorities.",
       endCategory: "busy",
     });
     expect(parsed.status).toBe("valid");
@@ -270,18 +282,34 @@ describe("customer termination marker", () => {
     expect(parsed.visibleText).toBe("I have to go.");
     expect(parsed.termination).toEqual({
       endedBy: "customer",
-      endReason: "Customer was busy and chose to end the call.",
+      endReason: "Customer ended the call because they needed to return to other priorities.",
       endCategory: "busy",
     });
   });
 
-  it("extracts balanced JSON when the reason contains braces", () => {
+  it("ignores model-authored reasons and derives trusted report metadata locally", () => {
     const parsed = parseCustomerTerminationOutput(
       'That is all. END_CALL>{"endedBy":"customer","reason":"Customer said the {details} were unclear.","category":"confusion"}',
     );
 
     expect(parsed.status).toBe("valid");
-    expect(parsed.termination?.endReason).toBe("Customer said the {details} were unclear.");
+    expect(parsed.termination?.endReason).toBe(
+      "Customer ended the call because the conversation remained unclear.",
+    );
+    expect(parsed.visibleText).toBe("That is all.");
+  });
+
+  it("accepts a category-only control block with no speakable evaluation reason", () => {
+    const parsed = parseCustomerTerminationOutput(
+      'Thanks for your time. I will think about it. <END_CALL>{"category":"other"}</END_CALL>',
+    );
+
+    expect(parsed.visibleText).toBe("Thanks for your time. I will think about it.");
+    expect(parsed.termination).toEqual({
+      endedBy: "customer",
+      endReason: "Customer chose to end the call.",
+      endCategory: "other",
+    });
   });
 
   it("never exposes a malformed control block as dialogue", () => {
