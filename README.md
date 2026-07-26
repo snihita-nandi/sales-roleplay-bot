@@ -1,65 +1,96 @@
 # Counterpart
 
-Counterpart is a browser-based AI sales roleplay application. A representative speaks with a configurable Gemini Live prospect that asks realistic questions, raises objections, reveals information gradually, and remains in character. Coaching is generated only after the live customer session has closed.
+Counterpart is a browser-based AI sales roleplay app. Sales representatives practice live customer conversations with configurable scenarios and receive transcript-based feedback after each call.
 
-## Architecture
+- [Live application](https://sales-roleplay-bot-fawn.vercel.app/)
+- [Demo video](https://youtu.be/z3SHN4h7Mi0)
 
-- `domain/` contains provider-independent category, archetype, difficulty, prompt, roleplay-state, and evaluation contracts.
-- `config/` contains practice categories, reusable customer archetypes, shared difficulty profiles, and rubrics. New domains and customers are added as validated configuration, not branching UI or prompt logic.
-- `infrastructure/gemini/` owns Gemini token provisioning and browser live audio.
-- `infrastructure/evaluation/` owns provider selection plus the Groq and Gemini post-call evaluators.
-- `app/api/` exposes public scenario summaries, single-use constrained session credentials, and isolated evaluation.
-- `components/` renders the scenario, call, and result experiences without owning customer behavior.
-
-Gemini Live uses a direct browser-to-Gemini WebSocket authenticated with a short-lived token minted by the server. The permanent `GEMINI_API_KEY` and private customer configuration never enter the browser bundle.
-
-## Scenario hierarchy
-
-Scenario selection has three configuration-driven levels:
-
-1. A practice category such as B2B Sales, Insurance, Retail, or Real Estate.
-2. A reusable customer archetype owned by that category.
-3. Easy, Medium, Hard, or Expert difficulty.
-
-An archetype owns the stable customer identity, context, motivations, facts, objections, and speaking style. Difficulty is a shared overlay that may modify only skepticism, patience, objection frequency, trust progression, and interruption tendency. The registry composes these inputs into the same `CustomerScenario` contract used by the prompt compiler and Gemini integration.
-
-Additional categories—including Banking, Healthcare, Automotive, Telecommunications, Technology, and Custom—can be added by supplying another category configuration with at least two archetypes. No category-specific behavior code is required.
-
-## Local development
-
-Use Node.js 20 or newer and define these server-only environment variables:
+## Workflow
 
 ```text
-GEMINI_API_KEY=your_key
-GROQ_API_KEY=your_key
-EVALUATION_PROVIDER=groq
+Choose industry, customer, scenario, and difficulty
+                         ↓
+             Start Gemini Live call
+                         ↓
+             Review live transcript
+                         ↓
+             Receive post-call evaluation
 ```
 
-`EVALUATION_PROVIDER` accepts `groq` or `gemini` and defaults to `gemini` when unset.
+## Features
 
-Then run:
+- 11 industries and 82 customer profiles
+- Initial, comparison, and follow-up scenarios
+- Four difficulty levels
+- Real-time Gemini Live voice roleplay
+- Live transcript, mute, interruptions, and call timer
+- Customer-controlled and manual call endings
+- Gemini or Groq post-call evaluation
+- Scorecard, transcript evidence, and suggested improvements
+
+Audio, transcripts, and evaluations are not stored.
+
+## Tech Stack
+
+Next.js 16, React 19, TypeScript, Tailwind CSS, Zod, Gemini Live, Groq, Vitest, and Playwright.
+
+## Setup
+
+Requirements: Node.js 20+, npm, a Gemini API key, and a browser with microphone access.
+
+```bash
+npm ci
+```
+
+Copy `.env.example` to `.env.local`:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+GROQ_API_KEY=your_groq_api_key_here
+EVALUATION_PROVIDER=gemini
+```
+
+`GROQ_API_KEY` is required only when `EVALUATION_PROVIDER=groq`.
 
 ```bash
 npm run dev
 ```
 
-The app is available at `http://localhost:3000`.
+Open [http://localhost:3000](http://localhost:3000).
 
-## Verification
+## Application Parts
+
+| Part | Location | Setup |
+| --- | --- | --- |
+| Frontend | `app/`, `components/`, `hooks/` | Runs with `npm run dev`; requires browser microphone permission |
+| API routes | `app/api/` | Runs with Next.js; reads keys from `.env.local` |
+| Voice | `infrastructure/gemini/` | Requires `GEMINI_API_KEY` |
+| Evaluation | `infrastructure/evaluation/` | Uses Gemini by default or Groq when configured |
+| Configuration | `config/`, `domain/scenarios/` | No additional environment variables |
+
+## Scripts
 
 ```bash
+npm run dev
+npm run build
+npm run start
 npm run typecheck
 npm run lint
 npm test
-npm run build
 npm run test:e2e
 ```
 
-The end-to-end command requires Playwright's Chromium browser to be available in the environment.
+## AI Tools and Keys
 
-## Current MVP boundaries
+| Tool | Use | Key |
+| --- | --- | --- |
+| Gemini Live | Real-time customer roleplay | `GEMINI_API_KEY` |
+| Gemini | Default call evaluation | `GEMINI_API_KEY` |
+| Groq | Optional call evaluation | `GROQ_API_KEY` |
+| Codex | Documentation assistance | No runtime key |
 
-- Audio is streamed but not stored.
-- Completed transcript text is sent to the evaluation endpoint and is not persisted.
-- Calls are limited to the configured three-to-eight minute scenario duration.
-- Authentication, distributed rate limiting, durable call history, and long-session resumption are intentionally out of scope.
+Keys remain server-side and must not be committed.
+
+## License
+
+MIT License
